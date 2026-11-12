@@ -1,0 +1,52 @@
+{
+  "scenario": "清分金额口径核对 · 扣款(debit)与退款(refund)同名 CTE 作用域影响分析样例",
+  "source_tables": [
+    {
+      "table": "ods_debit_detail",
+      "columns": [
+        "txn_id",
+        "order_id",
+        "card_id",
+        "line_id",
+        "debit_amt",
+        "debit_time",
+        "city_code"
+      ]
+    },
+    {
+      "table": "ods_refund_detail",
+      "columns": [
+        "txn_id",
+        "order_id",
+        "refund_amt",
+        "refund_time",
+        "refund_reason"
+      ]
+    },
+    {
+      "table": "dim_bus_line",
+      "columns": [
+        "line_id",
+        "line_name",
+        "company_id"
+      ]
+    }
+  ],
+  "models": [
+    {
+      "name": "dwd_amount_flow",
+      "description": "金额流水明细层：外层 WITH flow 读扣款，FROM 派生表内层同名 WITH flow 读退款，按 SQL 作用域各自解析",
+      "sql": "WITH flow AS (SELECT d.txn_id AS txn_id, d.order_id AS order_id, d.card_id AS card_id, d.line_id AS line_id, d.debit_amt AS flow_amt, d.debit_time AS flow_time FROM ods_debit_detail d WHERE d.city_code = '3301') SELECT f.txn_id AS txn_id, f.order_id AS order_id, f.card_id AS card_id, f.line_id AS line_id, f.flow_amt AS debit_amount, x.txn_id AS refund_txn_id, x.flow_amt AS refund_amount, x.flow_time AS refund_time FROM flow f INNER JOIN ( WITH flow AS (SELECT r.txn_id AS txn_id, r.order_id AS order_id, r.refund_amt AS flow_amt, r.refund_time AS flow_time FROM ods_refund_detail r) SELECT flow.txn_id AS txn_id, flow.order_id AS order_id, flow.flow_amt AS flow_amt, flow.flow_time AS flow_time FROM flow ) x ON f.order_id = x.order_id"
+    },
+    {
+      "name": "dws_line_amount_summary",
+      "description": "线路金额汇总中间层：按线路读取明细层的扣款/退款金额",
+      "sql": "SELECT w.line_id AS line_id, l.line_name AS line_name, w.debit_amount AS debit_amount, w.refund_amount AS refund_amount FROM dwd_amount_flow w INNER JOIN dim_bus_line l ON w.line_id = l.line_id"
+    },
+    {
+      "name": "ads_settlement_amount",
+      "description": "结算广告层：结算净额 = 扣款金额 - 退款金额，扣款进入 WHERE 条件会整列污染结算口径",
+      "sql": "WITH base AS (SELECT s.line_id AS line_id, s.line_name AS line_name, s.debit_amount AS debit_amount, s.refund_amount AS refund_amount FROM dws_line_amount_summary s) SELECT b.line_id AS line_id, b.line_name AS line_name, b.debit_amount AS settlement_debit, b.refund_amount AS settlement_refund, b.debit_amount - b.refund_amount AS settlement_net FROM base b WHERE b.debit_amount > 0"
+    }
+  ]
+}

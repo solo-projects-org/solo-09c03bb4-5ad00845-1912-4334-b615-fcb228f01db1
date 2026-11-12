@@ -10,6 +10,7 @@ from lineage import AnalysisError, analyze, build_models
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SAMPLE_PATH = os.path.join(BASE_DIR, "data", "sample_clearing.json")
+SHADOW_SAMPLE_PATH = os.path.join(BASE_DIR, "data", "sample_shadow_cte.json")
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024  # 8 MB
@@ -51,6 +52,14 @@ def sample():
     return jsonify(payload)
 
 
+@app.get("/api/sample/shadow-cte")
+def shadow_sample():
+    """扣款/退款同名 CTE（外层 WITH 与派生表内层 WITH）作用域样例。"""
+    with open(SHADOW_SAMPLE_PATH, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    return jsonify(payload)
+
+
 @app.post("/api/validate")
 def validate():
     """校验上传的 JSON 并返回字段清单，供前端选择待改字段。"""
@@ -64,6 +73,11 @@ def validate():
         "models": [
             {"name": name, "upstream": sorted(info.upstream)}
             for name, info in infos.items()
+        ],
+        # 跨作用域同名 CTE：每个名字分别在哪层定义（同一 WITH 重名会直接 400）
+        "shadowed_ctes": [
+            {"model": name, **item}
+            for name, info in infos.items() for item in info.shadowed_ctes
         ],
     })
 

@@ -362,6 +362,90 @@ check("diamond-路径均回源",
       all(c["path"][0]["type"] == "source" and c["path"][0]["column"] == "flag"
           for c in m5["columns"]))
 
+# 28. 跨作用域同名 CTE：外层 WITH c 读 t_a，FROM 派生表内层 WITH c 读 t_b ----------
+#     内层引用解析到内层定义，外层引用解析到外层定义，互不串扰；不再误判为重名。
+p = make_payload([
+    {"name": "m1", "sql":
+     "WITH c AS (SELECT a.id AS id, a.flag AS flag FROM t_a a) "
+     "SELECT c.id AS id, c.flag AS flag, x.f AS f FROM c INNER JOIN "
+     "( WITH c AS (SELECT bb.id AS id, bb.amt AS f FROM t_b bb) "
+     "  SELECT c.id AS id, c.f AS f FROM c ) x ON c.id = x.id"},
+])
+ss, infos, order = build_models(p)
+sh = infos["m1"].shadowed_ctes
+check("同名CTE-不再误判重名", len(sh) == 1 and sh[0]["name"] == "c", str(sh))
+if sh:
+    depths = [d["depth"] for d in sh[0]["definitions"]]
+    paths = [tuple(d["scope_path"]) for d in sh[0]["definitions"]]
+    check("同名CTE-标注内外两层", depths == [0, 1], str(depths))
+    check("同名CTE-作用域链路区分",
+          paths == [("m1", "c"), ("m1", "x", "c")], str(paths))
+# t_a.flag 只经外层 c：命中 flag，不命中内层 c 产出的 f
+r = analyze(p, "t_a", "flag")
+cols = {c["column"] for c in r["affected_models"][0]["columns"]}
+check("同名CTE-外层字段只污染外层链路", cols == {"flag"}, str(cols))
+# t_b.amt 只经内层 c：命中 f，不命中外层 c 的 id/flag
+r = analyze(p, "t_b", "amt")
+cols = {c["column"] for c in r["affected_models"][0]["columns"]}
+check("同名CTE-内层字段只污染内层链路", cols == {"f"}, str(cols))
+path = r["affected_models"][0]["columns"][0]["path"]
+check("同名CTE-路径写明内层定义层",
+      any(s.get("type") == "node" and "内层定义" in s.get("input_layer", "")
+          for s in path), str(path))
+check("同名CTE-路径回源到t_b",
+      path[0]["type"] == "source" and path[0]["relation"] == "t_b"
+      and path[0]["column"] == "amt")
+
+# 29. 同一个 WITH 内真重名仍然报错 -------------------------------------------------------
+p = make_payload([
+    {"name": "m_bad", "sql":
+     "WITH c AS (SELECT a.id AS id FROM t_a a), "
+     "c AS (SELECT a.flag AS f FROM t_a a) SELECT c.id AS id FROM c"},
+])
+try:
+    build_models(p)
+    check("同一WITH重名-报错", False)
+except AnalysisError as e:
+    check("同一WITH重名-报错", "同一个 WITH" in str(e) and "m_bad" in str(e), str(e))
+
+# 30. INNER JOIN 中的 FROM 派生表（非 From 直接子节点）应被接受 -------------------------
+p = make_payload([
+    {"name": "m1", "sql":
+     "SELECT a.id AS id, sq.f AS f FROM t_a a "
+     "INNER JOIN (SELECT b.id AS id, b.amt AS f FROM t_b b) sq ON a.id = sq.id"},
+])
+r = analyze(p, "t_b", "amt")
+check("JOIN派生表-值依赖命中",
+      {c["column"] for c in r["affected_models"][0]["columns"]} == {"f"})
+
+# 31. 同名 CTE 样例文件可端到端运行 ------------------------------------------------------
+shadow_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "data", "sample_shadow_cte.json")
+with open(shadow_path, encoding="utf-8") as fh:
+    shadow_sample = json.load(fh)
+# 扣款金额：外层 flow 链路 + 末端模型 WHERE 条件污染
+r = analyze(shadow_sample, "ods_debit_detail", "debit_amt")
+debit_cols = {
+    (m["model"], c["column"]) for m in r["affected_models"] for c in m["columns"]
+}
+check("扣款样例-命中扣款结算列",
+      ("ads_settlement_amount", "settlement_debit") in debit_cols
+      and ("dwd_amount_flow", "refund_amount") not in debit_cols)
+# 退款金额：内层 flow 链路，不污染扣款列
+r = analyze(shadow_sample, "ods_refund_detail", "refund_amt")
+refund_cols = {
+    (m["model"], c["column"]) for m in r["affected_models"] for c in m["columns"]
+}
+check("退款样例-命中退款结算列",
+      ("ads_settlement_amount", "settlement_refund") in refund_cols
+      and ("ads_settlement_amount", "settlement_debit") not in refund_cols,
+      str(sorted(refund_cols)))
+check("退款样例-净额同时受扣款退款影响",
+      ("ads_settlement_amount", "settlement_net") in refund_cols)
+check("样例-返回同名CTE分层",
+      any(s["name"] == "flow" and len(s["definitions"]) == 2
+          for s in r["shadowed_ctes"]))
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} 项失败：{FAILURES}")

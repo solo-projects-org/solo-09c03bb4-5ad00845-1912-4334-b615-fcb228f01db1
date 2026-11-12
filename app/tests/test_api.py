@@ -19,8 +19,12 @@ def check(name, cond, detail=""):
 client = app.test_client()
 SAMPLE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                       "data", "sample_clearing.json")
+SHADOW_SAMPLE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             "data", "sample_shadow_cte.json")
 with open(SAMPLE, encoding="utf-8") as fh:
     sample = json.load(fh)
+with open(SHADOW_SAMPLE, encoding="utf-8") as fh:
+    shadow_sample = json.load(fh)
 
 # 首页
 r = client.get("/")
@@ -29,6 +33,51 @@ check("首页 200", r.status_code == 200 and "换乘标志".encode() in r.data)
 # 样例接口
 r = client.get("/api/sample")
 check("样例接口", r.status_code == 200 and r.get_json()["models"])
+
+# 同名 CTE 样例接口
+r = client.get("/api/sample/shadow-cte")
+check("同名CTE样例接口", r.status_code == 200 and r.get_json()["models"])
+
+# 同名 CTE 样例校验通过，且返回同名 CTE 分层信息
+r = client.post("/api/validate", json=shadow_sample)
+body = r.get_json()
+check("同名CTE validate 通过", r.status_code == 200 and body["ok"] is True)
+shadow = body.get("shadowed_ctes", [])
+check("validate 返回同名CTE",
+      len(shadow) == 1 and shadow[0]["name"] == "flow"
+      and [d["depth"] for d in shadow[0]["definitions"]] == [0, 1],
+      str(shadow))
+
+# 扣款金额：外层 flow 链路；退款金额：内层 flow 链路，互不串扰
+r = client.post("/api/analyze?table=ods_debit_detail&column=debit_amt", json=shadow_sample)
+body = r.get_json()
+check("扣款 analyze 通过", r.status_code == 200 and body["ok"] is True)
+debit_pairs = {(m["model"], c["column"])
+               for m in body["result"]["affected_models"] for c in m["columns"]}
+check("扣款不污染退款列",
+      ("dwd_amount_flow", "refund_amount") not in debit_pairs
+      and ("ads_settlement_amount", "settlement_debit") in debit_pairs)
+r = client.post("/api/analyze?table=ods_refund_detail&column=refund_amt", json=shadow_sample)
+body = r.get_json()
+refund_pairs = {(m["model"], c["column"])
+                for m in body["result"]["affected_models"] for c in m["columns"]}
+check("退款不污染扣款列",
+      ("ads_settlement_amount", "settlement_debit") not in refund_pairs
+      and ("ads_settlement_amount", "settlement_refund") in refund_pairs,
+      str(sorted(refund_pairs)))
+check("analyze 返回同名CTE分层",
+      any(s["name"] == "flow" for s in body["result"]["shadowed_ctes"]))
+
+# 同一 WITH 真重名 -> 400
+bad_dup = {
+    "source_tables": [{"table": "t", "columns": ["a"]}],
+    "models": [{"name": "boom", "sql":
+                "WITH c AS (SELECT x.a AS a FROM t x), "
+                "c AS (SELECT x.a AS a FROM t x) SELECT c.a AS a FROM c"}],
+}
+r = client.post("/api/validate", json=bad_dup)
+check("同一WITH重名 400",
+      r.status_code == 400 and "同一个 WITH" in r.get_json()["error"])
 
 # 校验通过
 r = client.post("/api/validate", json=sample)

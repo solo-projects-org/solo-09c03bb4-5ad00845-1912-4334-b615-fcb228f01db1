@@ -55,14 +55,21 @@ class Leaf:
 
 @dataclass
 class QueryNode:
-    """一个 SELECT 作用域（根查询 / CTE / FROM 子查询 / WHERE 子查询）。"""
+    """一个 SELECT 作用域（根查询 / CTE / FROM 子查询 / WHERE 子查询）。
+
+    node_id 在模型内全局唯一，节点之间（含同名 CTE）一律通过 node_id 引用，
+    名称（name）仅用于展示；同名 CTE 各自处于不同作用域，由 depth / scope_path
+    / parent_id 区分实际定义位置。
+    """
     node_id: str
     kind: str  # root | cte | subquery
     name: str  # cte 名 / 子查询别名 / 根为模型名
     output_columns: list[str]
     # 每个输出列 -> 依赖的叶子集合
     output_leaves: dict[str, set[Leaf]]
-    # 关系名 -> (类型, 实际对象名)；类型为 table | model | cte | subquery
+    # 关系限定名 -> (类型, 实际对象)：
+    #   table   -> 源表名；model -> 上游模型名；
+    #   cte/subquery -> 目标 QueryNode 的 node_id
     sources: dict[str, tuple[str, str]]
     # JOIN ON / WHERE 中引用到的叶子
     predicate_leaves: set[Leaf]
@@ -70,6 +77,12 @@ class QueryNode:
     predicate_subqueries: list[str] = field(default_factory=list)
     # 对应的 sqlglot 作用域表达式，用于子查询匹配
     scope_expr: object = None
+    # 作用域层级：根查询为 0，每嵌套一层（派生表/CTE/谓词子查询）加 1
+    depth: int = 0
+    # 父查询节点 id（根节点为 None）
+    parent_id: str | None = None
+    # 从根到本节点的查询名链路，如 ["m1", "x", "flow"]，用于标注同名定义所在层
+    scope_path: list[str] = field(default_factory=list)
     # 运行期：被污染的叶子集合
     tainted_leaves: set[Leaf] = field(default_factory=set)
     # 运行期：被污染的输出列（值依赖或条件污染）
@@ -226,21 +239,43 @@ def _predicate_subquery_exprs(expression: exp.Expression) -> list[exp.Expression
     return result
 
 
+def _layer_label(node: "QueryNode") -> str:
+    """节点所在层的可读说明。scope_path[0] 恒为模型名，末位是节点自身名。"""
+    model_name = node.scope_path[0]
+    if node.kind == "root":
+        return f"模型「{model_name}」根查询（第 0 层）"
+    if node.kind == "cte":
+        if node.depth == 0:
+            return f"模型「{model_name}」根查询的 WITH（第 0 层，外层定义）"
+        chain = " > ".join(node.scope_path[1:-1]) or "根查询"
+        return (
+            f"第 {node.depth} 层嵌套作用域（模型「{model_name}」中 {chain} 内的 WITH，"
+            "内层定义，遮蔽外层同名 CTE）"
+        )
+    # 派生表 / 谓词子查询
+    chain = " > ".join(node.scope_path[1:-1]) or "根查询"
+    return f"第 {node.depth} 层嵌套子查询（模型「{model_name}」中 {chain} 内的「{node.name}」）"
+
+
 # ---------------------------------------------------------------------------
 # 单模型构建
 # ---------------------------------------------------------------------------
 
 def _build_model(model_name: str, sql: str,
                  source_schemas: dict[str, list[str]],
-                 model_names: set[str]) -> tuple[list[QueryNode], dict[str, QueryNode]]:
+                 model_names: set[str]) -> tuple[list[QueryNode], dict[str, QueryNode], list[dict]]:
     tree = _parse_sql(sql, model_name)
+    scopes = list(traverse_scope(tree))
     nodes: list[QueryNode] = []
-    by_name: dict[str, QueryNode] = {}
+    by_id: dict[str, QueryNode] = {}
+    expr_to_node: dict[exp.Expression, QueryNode] = {}
     sub_seq = 0
+    node_seq = 0
     # 延迟登记的谓词子查询：(所属节点, 内层 SELECT 表达式)
     pending_predicate_subs: list[tuple[QueryNode, exp.Expression]] = []
 
-    for scope in traverse_scope(tree):
+    # ---- 第一遍：建立节点并收集投影/谓词叶子（此时只认限定名，不解析目标） ----
+    for scope in scopes:
         expr = scope.expression
         parent = expr.parent
         if scope.is_root or parent is None:
@@ -248,7 +283,8 @@ def _build_model(model_name: str, sql: str,
             node_id = f"{model_name}#root"
         elif isinstance(parent, exp.CTE):
             kind, qname = "cte", parent.alias
-            node_id = f"{model_name}#cte:{qname}"
+            node_seq += 1
+            node_id = f"{model_name}#n{node_seq}:cte:{qname}"
         else:
             # FROM 中的派生表必须有别名；WHERE 中的谓词子查询（IN/EXISTS）不是关系，
             # 不能被外层按名引用，使用自动生成的内部名称。
@@ -256,10 +292,11 @@ def _build_model(model_name: str, sql: str,
             is_in_sub = isinstance(parent, exp.Subquery) and parent.find_ancestor(exp.In) is not None
             is_exists = isinstance(parent, exp.Exists)
             in_predicate = is_in_sub or is_exists
-            # SELECT 投影中的标量子查询（Subquery 父级是 Alias 而非 From/In）
+            # SELECT 投影中的标量子查询：Subquery 父级不是 From/Join/In
+            # （FROM 与 INNER JOIN 中的派生表、IN 谓词子查询均为合法写法）
             is_scalar = (
                 isinstance(parent, exp.Subquery)
-                and not isinstance(parent.parent, exp.From)
+                and not isinstance(parent.parent, (exp.From, exp.Join))
                 and parent.find_ancestor(exp.In) is None
             )
             if is_scalar:
@@ -272,7 +309,6 @@ def _build_model(model_name: str, sql: str,
                 sub_seq += 1
                 pred = "EXISTS" if is_exists else "IN"
                 qname = f"{pred} 子查询#{sub_seq}"
-                node_id = f"{model_name}#predsub:{sub_seq}"
             else:
                 kind = "subquery"
                 if not isinstance(parent, exp.Subquery):
@@ -280,51 +316,34 @@ def _build_model(model_name: str, sql: str,
                         f"模型「{model_name}」存在无法归类的子查询（父节点 {type(parent).__name__}），"
                         "本工具仅支持 FROM 派生表与 IN/EXISTS 谓词子查询。"
                     )
-                sub_alias = parent.alias
-                if not sub_alias:
+                qname = parent.alias
+                if not qname:
                     raise AnalysisError(
                         f"模型「{model_name}」存在未起别名的 FROM 子查询，请为其添加别名。"
                     )
-                qname = sub_alias
-                sub_seq += 1
-                node_id = f"{model_name}#sub:{qname}"
+            node_seq += 1
+            node_id = f"{model_name}#n{node_seq}:{kind}:{qname}"
 
-        if qname in by_name:
-            raise AnalysisError(f"模型「{model_name}」中 CTE/子查询名「{qname}」重复。")
-
-        # 关系清单
-        sources: dict[str, tuple[str, str]] = {}
-        for sname, source in scope.sources.items():
-            if isinstance(source, exp.Table):
-                actual = source.name
-                if actual in model_names:
-                    sources[sname] = ("model", actual)
-                else:
-                    if actual not in source_schemas:
-                        raise AnalysisError(
-                            f"模型「{model_name}」读取了未知表「{actual}」："
-                            "它既不在源表清单中，也不是已定义的模型。无法解析引用，分析已停止。"
-                        )
-                    sources[sname] = ("table", actual)
-            else:
-                ptype = type(source.expression.parent).__name__ if source.expression.parent else ""
-                if ptype == "CTE":
-                    sources[sname] = ("cte", source.expression.parent.alias)
-                else:
-                    alias = source.expression.parent.alias
-                    sources[sname] = ("subquery", alias)
-
-        # 输出列
-        output_columns: list[str] = []
-        output_leaves: dict[str, set[Leaf]] = {}
+        # 同一 WITH 子句内的 CTE 重名：真重名，必须报错。
+        # 不同作用域（外层 WITH vs 派生表内层 WITH）的同名 CTE 不在此列；
+        # 同一作用域内表/派生表别名与 CTE 同名属于 SQL 合法的名称遮蔽，
+        # 由 sqlglot 的 scope.sources 按实际定义解析，不在此处报错。
+        cte_aliases = [cte.alias for cte in scope.ctes]
+        dup_ctes = sorted({a for a in cte_aliases if cte_aliases.count(a) > 1})
+        if dup_ctes:
+            raise AnalysisError(
+                f"模型「{model_name}」的同一个 WITH 子句中 CTE 名「{ '、'.join(dup_ctes) }」"
+                "重复定义。同一 WITH 内不允许重名；仅不同作用域（如外层 WITH 与 FROM "
+                "派生表内层 WITH）允许使用同名 CTE，内层定义会遮蔽外层定义。"
+            )
 
         node = QueryNode(
             node_id=node_id,
             kind=kind,
             name=qname,
-            output_columns=output_columns,
-            output_leaves=output_leaves,
-            sources=sources,
+            output_columns=[],
+            output_leaves={},
+            sources={},
             predicate_leaves=set(),
             scope_expr=expr,
         )
@@ -335,13 +354,13 @@ def _build_model(model_name: str, sql: str,
                 raise AnalysisError(
                     f"模型「{model_name}」的查询「{qname}」存在无法命名的输出表达式，请显式加别名。"
                 )
-            if out_name in output_leaves:
+            if out_name in node.output_leaves:
                 raise AnalysisError(
                     f"模型「{model_name}」的查询「{qname}」输出列「{out_name}」重复。"
                 )
             leaves = _collect_leaves(projection, scope, node, model_name)
-            output_columns.append(out_name)
-            output_leaves[out_name] = leaves
+            node.output_columns.append(out_name)
+            node.output_leaves[out_name] = leaves
 
         # WHERE
         where = expr.args.get("where")
@@ -370,35 +389,106 @@ def _build_model(model_name: str, sql: str,
                 "本工具不支持该写法。"
             )
 
-        # 源表列存在性 + CTE/子查询/上游模型列存在性
+        nodes.append(node)
+        by_id[node.node_id] = node
+        expr_to_node[expr] = node
+
+    # ---- 第二遍：按 SQL 作用域解析 sources，并建立层级/作用域链路 ----
+    # 嵌套深度：根查询为 0；FROM 派生表 / 谓词子查询每包一层 +1；
+    # CTE 内层查询与其定义者同层（CTE 只是命名作用域，不构成查询嵌套）。
+    # IN 的内层 SELECT 有 Subquery 包裹；EXISTS 的内层直接挂在 Exists 下，
+    # 两者都要计数，否则 EXISTS 子查询会被误算为第 0 层。
+    # 注意 CTE 内层 SELECT 的 scope.parent 是“定义该 CTE 的 SELECT”，
+    # 直接沿 AST 父链数子查询层数即可得到正确深度。
+    _NEST_WRAPPERS = (exp.Subquery, exp.Exists)
+
+    def _nest_depth(expr: exp.Expression) -> int:
+        depth = 0
+        cur = expr.parent
+        while cur is not None:
+            if isinstance(cur, _NEST_WRAPPERS):
+                depth += 1
+            cur = cur.parent
+        return depth
+
+    def _definer_node(expr: exp.Expression) -> QueryNode | None:
+        """包裹该 SELECT 的最近查询节点：CTE 找定义它的 SELECT，子查询找外层 SELECT。"""
+        cur = expr.parent
+        while cur is not None and not isinstance(cur, exp.Select):
+            cur = cur.parent
+        return expr_to_node.get(cur) if cur is not None else None
+
+    for scope, node in zip(scopes, nodes):
+        definer = _definer_node(scope.expression)
+        node.parent_id = definer.node_id if definer is not None else None
+        node.depth = _nest_depth(scope.expression)
+
+    # 作用域链路自顶向下计算（traverse_scope 为后序，子节点先于定义者出现）：
+    # 恒以模型名（根查询名）开头，末位是本节点名，使同名 CTE 能通过
+    # “定义者链路 + 层级”区分各自定义位置。
+    roots = [n for n in nodes if n.parent_id is None]
+    stack = list(roots)
+    while stack:
+        cur = stack.pop()
+        if cur.parent_id is None:
+            cur.scope_path = [cur.name]
+        else:
+            cur.scope_path = list(by_id[cur.parent_id].scope_path) + [cur.name]
+        stack.extend(n for n in nodes if n.parent_id == cur.node_id)
+
+    # 第三遍：按 SQL 作用域解析 sources 并校验列存在性。
+    # scope.sources 已由 sqlglot 按 SQL 作用域规则解析：
+    # 内层同名 CTE 遮蔽外层，外层查询读不到内层定义。
+    for scope, node in zip(scopes, nodes):
+        for sname, source in scope.sources.items():
+            if isinstance(source, exp.Table):
+                actual = source.name
+                if actual in model_names:
+                    node.sources[sname] = ("model", actual)
+                else:
+                    if actual not in source_schemas:
+                        raise AnalysisError(
+                            f"模型「{model_name}」读取了未知表「{actual}」："
+                            "它既不在源表清单中，也不是已定义的模型。无法解析引用，分析已停止。"
+                        )
+                    node.sources[sname] = ("table", actual)
+            else:
+                target = expr_to_node.get(source.expression)
+                if target is None:
+                    raise AnalysisError(
+                        f"模型「{model_name}」存在无法登记作用域的子查询，请检查 SQL 写法。"
+                    )
+                ptype = type(source.expression.parent).__name__ if source.expression.parent else ""
+                stype = "cte" if ptype == "CTE" else "subquery"
+                # 保存目标节点的 node_id 而非名字：同名 CTE 各自独立、按作用域解析
+                node.sources[sname] = (stype, target.node_id)
+
+        # 源表列存在性 + CTE/子查询输出列存在性（按实际读取的作用域节点校验）
         all_leaves: set[Leaf] = set(node.predicate_leaves)
-        for ls in output_leaves.values():
+        for ls in node.output_leaves.values():
             all_leaves |= ls
         for leaf in all_leaves:
-            stype, actual = _source_of(node, leaf.relation)
+            stype, ref = _source_of(node, leaf.relation)
             if stype == "table":
-                if leaf.column not in source_schemas.get(actual, []):
+                if leaf.column not in source_schemas.get(ref, []):
                     raise AnalysisError(
-                        f"模型「{model_name}」引用了源表「{actual}」上不存在的列「{leaf.column}」，"
+                        f"模型「{model_name}」引用了源表「{ref}」上不存在的列「{leaf.column}」，"
                         "无法解析引用，分析已停止。"
                     )
             elif stype == "model":
                 # 上游模型的输出列在拓扑构建后统一校验
-                pass
+                continue
             else:
-                upstream = by_name.get(actual)
-                if upstream is not None and leaf.column not in upstream.output_columns:
+                upstream = by_id[ref]
+                if leaf.column not in upstream.output_columns:
                     raise AnalysisError(
-                        f"模型「{model_name}」的查询「{qname}」引用了"
-                        f"{'CTE' if stype == 'cte' else '子查询'}「{actual}」上不存在的列"
-                        f"「{leaf.column}」，无法解析引用，分析已停止。"
+                        f"模型「{model_name}」的查询「{node.name}」引用了"
+                        f"{'CTE' if stype == 'cte' else '子查询'}「{upstream.name}」"
+                        f"（{_layer_label(upstream)}）上不存在的列「{leaf.column}」，"
+                        "无法解析引用，分析已停止。"
                     )
 
-        nodes.append(node)
-        by_name[qname] = node
-
     # 所有作用域节点已入表，统一登记谓词中的 IN/EXISTS 子查询
-    expr_to_node = {n.scope_expr: n for n in nodes}
     for owner, inner_select in pending_predicate_subs:
         target = expr_to_node.get(inner_select)
         if target is None:
@@ -407,14 +497,36 @@ def _build_model(model_name: str, sql: str,
             )
         owner.predicate_subqueries.append(target.node_id)
 
-    return nodes, by_name
+    # 同名 CTE 汇总：仅跨作用域的同名定义（同一 WITH 重名已在上面报错）
+    cte_groups: dict[str, list[QueryNode]] = {}
+    for n in nodes:
+        if n.kind == "cte":
+            cte_groups.setdefault(n.name, []).append(n)
+    shadowed_ctes = [
+        {
+            "name": name,
+            "definitions": [
+                {
+                    "depth": n.depth,
+                    "layer": _layer_label(n),
+                    "scope_path": list(n.scope_path),
+                    "node_id": n.node_id,
+                }
+                for n in sorted(group, key=lambda x: x.depth)
+            ],
+        }
+        for name, group in sorted(cte_groups.items())
+        if len(group) > 1
+    ]
+
+    return nodes, by_id, shadowed_ctes
 
 
 def _source_of(node: QueryNode, relation: str) -> tuple[str, str]:
-    for sname, (stype, actual) in node.sources.items():
-        if sname == relation:
-            return stype, actual
-    raise AnalysisError(f"内部错误：查询「{node.name}」找不到关系「{relation}」。")
+    entry = node.sources.get(relation)
+    if entry is None:
+        raise AnalysisError(f"内部错误：查询「{node.name}」找不到关系「{relation}」。")
+    return entry
 
 
 # ---------------------------------------------------------------------------
@@ -426,8 +538,10 @@ class ModelInfo:
     name: str
     sql: str
     nodes: list[QueryNode]
-    by_name: dict[str, QueryNode]
+    by_id: dict[str, QueryNode]
     upstream: set[str]  # 直接读取的上游模型
+    # 跨作用域同名 CTE 的定义位置说明（同一 WITH 重名属于错误，不会出现在这里）
+    shadowed_ctes: list[dict] = field(default_factory=list)
     condition_tainted: bool = False
 
 
@@ -461,16 +575,20 @@ def build_models(payload: dict) -> tuple[dict[str, list[str]], dict[str, ModelIn
         mname, sql = m["name"], m.get("sql", "")
         if not isinstance(sql, str) or not sql.strip():
             raise AnalysisError(f"模型「{mname}」缺少非空 sql。")
-        nodes, by_name = _build_model(mname, sql, source_schemas, model_names)
+        nodes, by_id, shadowed_ctes = _build_model(
+            mname, sql, source_schemas, model_names
+        )
         upstream = {
-            actual
+            ref
             for node in nodes
-            for stype, actual in node.sources.values()
+            for stype, ref in node.sources.values()
             if stype == "model"
         }
         if mname in upstream:
             raise AnalysisError(f"模型「{mname}」不能读取自身。")
-        infos[mname] = ModelInfo(mname, sql, nodes, by_name, upstream)
+        infos[mname] = ModelInfo(
+            mname, sql, nodes, by_id, upstream, shadowed_ctes=shadowed_ctes
+        )
 
     # DAG 校验与拓扑序
     order = _topological_order(infos)
@@ -482,13 +600,13 @@ def build_models(payload: dict) -> tuple[dict[str, list[str]], dict[str, ModelIn
             for ls in node.output_leaves.values():
                 all_leaves |= ls
             for leaf in all_leaves:
-                stype, actual = _source_of(node, leaf.relation)
+                stype, ref = _source_of(node, leaf.relation)
                 if stype == "model":
-                    up = infos[actual]
+                    up = infos[ref]
                     root = up.nodes[-1]  # traverse_scope 为后序，根在最后
                     if leaf.column not in root.output_columns:
                         raise AnalysisError(
-                            f"模型「{info.name}」引用了上游模型「{actual}」上不存在的输出列"
+                            f"模型「{info.name}」引用了上游模型「{ref}」上不存在的输出列"
                             f"「{leaf.column}」，无法解析引用，分析已停止。"
                         )
     return source_schemas, infos, order
@@ -530,7 +648,6 @@ def _propagate_within_model(info: ModelInfo,
     返回：本模型根查询每个被污染输出列 -> 一条依赖路径
     """
     nodes = info.nodes  # traverse_scope 后序：被依赖的 CTE/子查询在前
-    by_name = info.by_name
 
     def seed_leaves(node: QueryNode) -> set[Leaf]:
         seeds: set[Leaf] = set()
@@ -541,7 +658,7 @@ def _propagate_within_model(info: ModelInfo,
         return seeds
 
     # 多轮定点：节点按后序排列，CTE/子查询间若存在引用链也可收敛
-    by_id = {n.node_id: n for n in nodes}
+    by_id = info.by_id
     for _ in range(len(nodes) + 1):
         changed = False
         for node in nodes:
@@ -550,10 +667,12 @@ def _propagate_within_model(info: ModelInfo,
             # 1) 上游传入的污染叶子
             node.tainted_leaves |= seed_leaves(node)
 
-            # 2) 内部 CTE/子查询输出污染 -> 对应叶子污染
-            for sname, (stype, actual) in node.sources.items():
+            # 2) 内部 CTE/子查询输出污染 -> 对应叶子污染。
+            #    sources 中的引用按 SQL 作用域解析为具体 node_id，
+            #    同名 CTE 各自独立，内层遮蔽外层。
+            for sname, (stype, ref) in node.sources.items():
                 if stype in ("cte", "subquery"):
-                    up = by_name[actual]
+                    up = by_id[ref]
                     for col in up.tainted_outputs:
                         node.tainted_leaves.add(Leaf(relation=sname, column=col))
 
@@ -600,8 +719,7 @@ def _build_paths(info: ModelInfo,
     路径由“步骤”组成，每一步描述一个查询节点中 输入列 -> 输出列 的传递，
     via 标记该步是值依赖(value)还是条件污染(condition)。
     """
-    by_name = info.by_name
-    by_id = {n.node_id: n for n in info.nodes}
+    by_id = info.by_id
 
     def find_path(node: QueryNode, col: str, seen: frozenset) -> list[dict] | None:
         key = (node.node_id, col)
@@ -614,6 +732,9 @@ def _build_paths(info: ModelInfo,
             "model": info.name,
             "query": node.name,
             "output": col,
+            "depth": node.depth,
+            "scope_path": list(node.scope_path),
+            "layer": _layer_label(node),
         }
         cond_leaf_hit = bool(node.predicate_leaves & node.tainted_leaves)
         value_leaves = [lf for lf in node.output_leaves[col] if lf in node.tainted_leaves]
@@ -627,28 +748,30 @@ def _build_paths(info: ModelInfo,
                     ordered.append((lf, "condition"))
 
         for leaf, via in ordered:
-            stype, actual = node.sources[leaf.relation]
+            stype, ref = node.sources[leaf.relation]
             cur = dict(step)
             cur.update({
                 "via": via,
-                "input_relation": actual,
+                "input_relation": ref,
                 "input_qualifier": leaf.relation,
                 "input_column": leaf.column,
             })
             if stype in ("cte", "subquery"):
-                up = by_name[actual]
+                up = by_id[ref]
+                cur["input_relation"] = up.name
+                cur["input_layer"] = _layer_label(up)
                 if leaf.column in up.tainted_outputs:
                     sub = find_path(up, leaf.column, seen)
                     if sub is not None:
                         return sub + [cur]
             elif stype == "model":
-                up_paths = upstream_paths.get(actual, {})
+                up_paths = upstream_paths.get(ref, {})
                 if leaf.column in up_paths:
                     return up_paths[leaf.column] + [cur]
             else:  # 源表：路径起点
                 return [{
                     "type": "source",
-                    "relation": actual,
+                    "relation": ref,
                     "column": leaf.column,
                 }, cur]
 
@@ -667,6 +790,7 @@ def _build_paths(info: ModelInfo,
                         "input_relation": sub_node.name,
                         "input_qualifier": sub_node.name,
                         "input_column": sub_col,
+                        "input_layer": _layer_label(sub_node),
                         "predicate": pred_kind,
                     })
                     return sub_path + [cur]
@@ -751,9 +875,18 @@ def analyze(payload: dict, target_table: str, target_column: str) -> dict:
                 "path": path,
             })
         # 条件污染判定（根查询或任一内部查询命中条件，含 IN 谓词子查询）
-        by_id = {n.node_id: n for n in info.nodes}
+        by_id = info.by_id
+        # 仅对确实存在跨作用域同名的 CTE 名称做层级消歧，其余保持简短查询名
+        shadow_names = {item["name"] for item in info.shadowed_ctes}
+
+        def _query_label(n: QueryNode) -> str:
+            if n.depth == 0 or n.name not in shadow_names:
+                return n.name
+            chain = " > ".join(n.scope_path[1:-1]) or "根查询"
+            return f"{n.name}（{chain} 内，第 {n.depth} 层）"
+
         condition_queries = sorted({
-            n.name for n in info.nodes
+            _query_label(n) for n in info.nodes
             if (n.predicate_leaves & n.tainted_leaves)
             or any(by_id[sid].tainted_outputs for sid in n.predicate_subqueries)
         })
@@ -769,6 +902,11 @@ def analyze(payload: dict, target_table: str, target_column: str) -> dict:
         "affected_models": affected,
         "model_count": len(affected),
         "column_count": sum(len(m["columns"]) for m in affected),
+        # 跨作用域同名 CTE：写明每个名字分别在哪一层定义（同一 WITH 重名在校验阶段即报错）
+        "shadowed_ctes": [
+            {"model": name, **item}
+            for name in order for item in infos[name].shadowed_ctes
+        ],
     }
 
 
